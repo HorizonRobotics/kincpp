@@ -2,6 +2,13 @@
 kincpp is a C++ library for computing both forward and inverse kinematics for arbitrary robot
 manipulators. It is written entirely in C++ for speed and has pybind bindings for python.
 Any manipulator can be modelled by simply providing its home configuration end-effector transform `M` and the joint screw axes `S`.
+
+Newton convergence checks actual TCP Cartesian displacement and rotation
+error. The linear component of the spatial error twist is not a TCP distance:
+it depends on the frame origin and couples translation with rotation. The
+regression in `testing/position_convergence_test.py` includes a one-meter
+lever with 5 mm TCP error that the old spatial-twist check accepted at a 1 mm
+tolerance. Success is rechecked after final joint-limit projection as well.
 A tool to compute this for modelled robots can be found [here](https://github.com/Interbotix/kinematics_from_description).
 
 Core logic to compute FK and Newton-based IK was largely extracted / refactored from

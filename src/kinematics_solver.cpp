@@ -14,11 +14,9 @@ KinematicsSolver::KinematicsSolver(const MatX& M, const MatX& S, const VecX& low
                                    const VecX& upper_joint_limits)
     : M(Mat4::Identity()), S(S), lower_joint_limits(lower_joint_limits.array()),
       upper_joint_limits(upper_joint_limits.array()) {
-    if (M.rows() != 4 || M.cols() != 4 || !M.allFinite() ||
-        S.rows() != 6 || S.cols() == 0 || !S.allFinite() ||
-        lower_joint_limits.size() != S.cols() ||
-        upper_joint_limits.size() != S.cols() ||
-        lower_joint_limits.array().isNaN().any() ||
+    if (M.rows() != 4 || M.cols() != 4 || !M.allFinite() || S.rows() != 6 || S.cols() == 0 ||
+        !S.allFinite() || lower_joint_limits.size() != S.cols() ||
+        upper_joint_limits.size() != S.cols() || lower_joint_limits.array().isNaN().any() ||
         upper_joint_limits.array().isNaN().any() ||
         (lower_joint_limits.array() > upper_joint_limits.array()).any()) {
         throw std::invalid_argument("Expected finite M[4,4], S[6,J], and ordered "
@@ -196,9 +194,13 @@ std::pair<bool, VecX> KinematicsSolver::IK_NM(const CommonParams& common_params,
     Mat4 Tdiff = TransInv(Tfk) * desired_ee_tf;
     VecX Vs = Adjoint(Tfk) * SE3ToVec(MatrixLog6(Tdiff));
     Vec3 angular(Vs(0), Vs(1), Vs(2));
-    Vec3 linear(Vs(3), Vs(4), Vs(5));
+    // Spatial twist v mixes TCP translation with rotation about the frame
+    // origin. Its norm is not a TCP position error and can both stop early
+    // and reject already valid poses. Test the actual Cartesian displacement.
+    Vec3 position_error = desired_ee_tf.block<3, 1>(0, 3) - Tfk.block<3, 1>(0, 3);
 
-    bool err = (angular.norm() > orientation_tolerance || linear.norm() > position_tolerance);
+    bool err =
+        (angular.norm() > orientation_tolerance || position_error.norm() > position_tolerance);
     MatX Jvt;
     VecX curr_q = q_guess;
     while (err && i++ < max_iterations) {
@@ -218,8 +220,9 @@ std::pair<bool, VecX> KinematicsSolver::IK_NM(const CommonParams& common_params,
 
         // Compute error
         angular = Vec3(Vs(0), Vs(1), Vs(2));
-        linear = Vec3(Vs(3), Vs(4), Vs(5));
-        err = (angular.norm() > orientation_tolerance || linear.norm() > position_tolerance);
+        position_error = desired_ee_tf.block<3, 1>(0, 3) - Tfk.block<3, 1>(0, 3);
+        err =
+            (angular.norm() > orientation_tolerance || position_error.norm() > position_tolerance);
     }
 
     // If we weren't projecting to the joint limits during the Newton updates, let's post clip
@@ -231,6 +234,14 @@ std::pair<bool, VecX> KinematicsSolver::IK_NM(const CommonParams& common_params,
         });
         // Clamp joint positions to limits
         curr_q = curr_q.array().max(lower_joint_limits).min(upper_joint_limits).matrix();
+        // Report convergence for the returned configuration after clipping.
+        Tfk = ForwardKinematics(curr_q);
+        Tdiff = TransInv(Tfk) * desired_ee_tf;
+        Vs = Adjoint(Tfk) * SE3ToVec(MatrixLog6(Tdiff));
+        angular = Vec3(Vs(0), Vs(1), Vs(2));
+        position_error = desired_ee_tf.block<3, 1>(0, 3) - Tfk.block<3, 1>(0, 3);
+        err =
+            (angular.norm() > orientation_tolerance || position_error.norm() > position_tolerance);
     }
 
     return std::make_pair(!err, curr_q);
