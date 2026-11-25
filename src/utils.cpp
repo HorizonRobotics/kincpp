@@ -186,6 +186,12 @@ Mat4 MatrixLog6(const Mat4& T) {
 
     // Compute the logarithm of the rotation matrix
     Mat3 omgmat = MatrixLog3(R);
+    // TODO(MatrixLog6): Use SO3ToVec(omgmat).norm() for the rotation angle.
+    // This skew matrix's Frobenius norm is sqrt(2) times the angle, biasing
+    // the linear-log coefficient below. The angular vector and Newton's
+    // orientation tolerance are unchanged. Add mixed rotation/translation
+    // Exp6(Log6(T)) regression coverage before fixing this separately from
+    // the Cartesian convergence fix bdff69f. See docs/matrixlog6_todo.md.
     double theta = omgmat.norm();
 
     // Initialize the return matrix

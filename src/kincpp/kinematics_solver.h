@@ -13,14 +13,14 @@ typedef enum {
 struct CommonParams
 {
     Mat4 desired_ee_tf;
-    Vec6 q_guess;
+    VecX q_guess;
     int iters{};
 };
 
 struct BatchedCommonParams
 {
     std::vector<Mat4> desired_ee_tfs;
-    MatX6 q_guesses;
+    MatX q_guesses;
     int iters{};
 };
 
@@ -60,7 +60,7 @@ class KinematicsSolver
     ~KinematicsSolver();
 
     Mat4 ForwardKinematics(const VecX& q);
-    std::vector<Mat4> BatchedForwardKinematics(const MatX6& q);
+    std::vector<Mat4> BatchedForwardKinematics(const MatX& q);
     std::pair<bool, VecX> InverseKinematics(const IKParams& params);
     std::pair<std::vector<bool>, MatX> BatchedInverseKinematics(const IKParams& params);
 
@@ -68,6 +68,7 @@ class KinematicsSolver
     MatX SpatialVelocityJacobian(const VecX& q);
 
   protected:
+    void ValidateConfig(const VecX& q) const;
     std::pair<bool, VecX> IK_NM(const CommonParams& common_params,
                                 const NewtonParams& newton_params);
     std::pair<bool, VecX> IK_QP(const CommonParams& common_params, const QPParams& qp_params);

@@ -4,6 +4,7 @@
 #include <pybind11/eigen.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <stdexcept>
 
 namespace py = pybind11;
 
@@ -11,8 +12,24 @@ namespace kincpp
 {
 KinematicsSolver::KinematicsSolver(const MatX& M, const MatX& S, const VecX& lower_joint_limits,
                                    const VecX& upper_joint_limits)
-    : M(M), S(S), lower_joint_limits(lower_joint_limits.array()),
+    : M(Mat4::Identity()), S(S), lower_joint_limits(lower_joint_limits.array()),
       upper_joint_limits(upper_joint_limits.array()) {
+    if (M.rows() != 4 || M.cols() != 4 || !M.allFinite() || S.rows() != 6 || S.cols() == 0 ||
+        !S.allFinite() || lower_joint_limits.size() != S.cols() ||
+        upper_joint_limits.size() != S.cols() || lower_joint_limits.array().isNaN().any() ||
+        upper_joint_limits.array().isNaN().any() ||
+        (lower_joint_limits.array() > upper_joint_limits.array()).any()) {
+        throw std::invalid_argument("Expected finite M[4,4], S[6,J], and ordered "
+                                    "joint limits[J]");
+    }
+    this->M = M;
+}
+
+void KinematicsSolver::ValidateConfig(const VecX& q) const {
+    if (q.size() != S.cols() || !q.allFinite()) {
+        throw std::invalid_argument("Joint configuration must contain J finite "
+                                    "entries matching S[6,J]");
+    }
 }
 
 KinematicsSolver::~KinematicsSolver() = default;
@@ -27,6 +44,7 @@ KinematicsSolver::~KinematicsSolver() = default;
  * Notes: FK means Forward Kinematics
  */
 Mat4 KinematicsSolver::ForwardKinematics(const VecX& q) {
+    ValidateConfig(q);
     Mat4 T = M;
     for (int i = (q.size() - 1); i > -1; i--) {
         T = MatrixExp6(VecToSE3(S.col(i) * q(i))) * T;
@@ -36,10 +54,14 @@ Mat4 KinematicsSolver::ForwardKinematics(const VecX& q) {
 
 /* Function: Batched version of ForwardKinematics.
  *           Uses OMP threads for fast parallelization.
- * Inputs: Joint configurations as a (N, 6) matrix.
+ * Inputs: Joint configurations as a (N, J) matrix.
  * Returns: A vector of end-effector transformation matrices.
  */
-std::vector<Mat4> KinematicsSolver::BatchedForwardKinematics(const MatX6& q) {
+std::vector<Mat4> KinematicsSolver::BatchedForwardKinematics(const MatX& q) {
+    if (q.cols() != S.cols() || !q.allFinite()) {
+        throw std::invalid_argument("Batched configurations must have shape "
+                                    "[N,J] with finite entries");
+    }
     std::vector<Mat4> res(q.rows());
 
 #pragma omp parallel for
@@ -54,6 +76,7 @@ std::vector<Mat4> KinematicsSolver::BatchedForwardKinematics(const MatX6& q) {
  * Returns: 6xn geometric Jacobian using velocity twist.
  */
 MatX KinematicsSolver::VelocityTwistJacobian(const VecX& q) {
+    ValidateConfig(q);
     MatX Jvt = S;
     Mat4 T = Mat4::Identity();
     VecX sListTemp(S.col(0).size());
@@ -88,6 +111,11 @@ MatX KinematicsSolver::SpatialVelocityJacobian(const VecX& q) {
  *              a (J, ) vector of joint angles
  */
 std::pair<bool, VecX> KinematicsSolver::InverseKinematics(const IKParams& params) {
+    ValidateConfig(params.common_params.q_guess);
+    if (!params.common_params.desired_ee_tf.allFinite()) {
+        throw std::invalid_argument("Desired end-effector transform "
+                                    "must be finite");
+    }
     switch (params.solver_type) {
         case NEWTON:
             return IK_NM(params.common_params, params.newton_params);
@@ -108,10 +136,22 @@ std::pair<bool, VecX> KinematicsSolver::InverseKinematics(const IKParams& params
 std::pair<std::vector<bool>, MatX>
 KinematicsSolver::BatchedInverseKinematics(const IKParams& params) {
     std::vector<Mat4> desired_ee_tfs = params.batched_common_params.desired_ee_tfs;
-    MatX6 q_guesses = params.batched_common_params.q_guesses;
+    MatX q_guesses = params.batched_common_params.q_guesses;
+    if (q_guesses.cols() != S.cols() || !q_guesses.allFinite() ||
+        q_guesses.rows() != static_cast<int>(desired_ee_tfs.size())) {
+        throw std::invalid_argument("Batched seeds [N,J] must match the "
+                                    "desired transform count and S[6,J]");
+    }
+    for (const auto& target : desired_ee_tfs) {
+        if (!target.allFinite()) {
+            throw std::invalid_argument("Desired end-effector transforms "
+                                        "must be finite");
+        }
+    }
 
     size_t batch_size = desired_ee_tfs.size();
-    std::vector<bool> success_res(batch_size);
+    // vector<bool> packs flags into shared words, so parallel writes race.
+    std::vector<int> success_flags(batch_size);
     MatX q_res(batch_size, q_guesses.cols());
 
 #pragma omp parallel for
@@ -132,9 +172,10 @@ KinematicsSolver::BatchedInverseKinematics(const IKParams& params) {
         VecX q;
         std::tie(success, q) = InverseKinematics(tmp_ik_params);
 
-        success_res.at(i) = success;
+        success_flags.at(i) = static_cast<int>(success);
         q_res.row(i) = q.transpose();
     }
+    std::vector<bool> success_res(success_flags.begin(), success_flags.end());
     return {success_res, q_res};
 }
 
@@ -153,9 +194,13 @@ std::pair<bool, VecX> KinematicsSolver::IK_NM(const CommonParams& common_params,
     Mat4 Tdiff = TransInv(Tfk) * desired_ee_tf;
     VecX Vs = Adjoint(Tfk) * SE3ToVec(MatrixLog6(Tdiff));
     Vec3 angular(Vs(0), Vs(1), Vs(2));
-    Vec3 linear(Vs(3), Vs(4), Vs(5));
+    // Spatial twist v mixes TCP translation with rotation about the frame
+    // origin. Its norm is not a TCP position error and can both stop early
+    // and reject already valid poses. Test the actual Cartesian displacement.
+    Vec3 position_error = desired_ee_tf.block<3, 1>(0, 3) - Tfk.block<3, 1>(0, 3);
 
-    bool err = (angular.norm() > orientation_tolerance || linear.norm() > position_tolerance);
+    bool err =
+        (angular.norm() > orientation_tolerance || position_error.norm() > position_tolerance);
     MatX Jvt;
     VecX curr_q = q_guess;
     while (err && i++ < max_iterations) {
@@ -175,8 +220,9 @@ std::pair<bool, VecX> KinematicsSolver::IK_NM(const CommonParams& common_params,
 
         // Compute error
         angular = Vec3(Vs(0), Vs(1), Vs(2));
-        linear = Vec3(Vs(3), Vs(4), Vs(5));
-        err = (angular.norm() > orientation_tolerance || linear.norm() > position_tolerance);
+        position_error = desired_ee_tf.block<3, 1>(0, 3) - Tfk.block<3, 1>(0, 3);
+        err =
+            (angular.norm() > orientation_tolerance || position_error.norm() > position_tolerance);
     }
 
     // If we weren't projecting to the joint limits during the Newton updates, let's post clip
@@ -188,6 +234,14 @@ std::pair<bool, VecX> KinematicsSolver::IK_NM(const CommonParams& common_params,
         });
         // Clamp joint positions to limits
         curr_q = curr_q.array().max(lower_joint_limits).min(upper_joint_limits).matrix();
+        // Report convergence for the returned configuration after clipping.
+        Tfk = ForwardKinematics(curr_q);
+        Tdiff = TransInv(Tfk) * desired_ee_tf;
+        Vs = Adjoint(Tfk) * SE3ToVec(MatrixLog6(Tdiff));
+        angular = Vec3(Vs(0), Vs(1), Vs(2));
+        position_error = desired_ee_tf.block<3, 1>(0, 3) - Tfk.block<3, 1>(0, 3);
+        err =
+            (angular.norm() > orientation_tolerance || position_error.norm() > position_tolerance);
     }
 
     return std::make_pair(!err, curr_q);
